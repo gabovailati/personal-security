@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -52,21 +53,65 @@ log = logging.getLogger("reolink")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# (input $/MTok, output $/MTok, cache_write $/MTok, cache_read $/MTok)
+_MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
+    "claude-haiku-4-5":           (0.80,  4.00,  1.00,  0.08),
+    "claude-haiku-4-5-20251001":  (0.80,  4.00,  1.00,  0.08),
+    "claude-sonnet-4-6":          (3.00, 15.00,  3.75,  0.30),
+    "claude-opus-4-7":           (15.00, 75.00, 18.75,  1.50),
+}
 
-THUMB_SYSTEM = """You analyze still thumbnails from a home Reolink security camera.
 
-Return a JSON object describing what you see. Be brief and factual. Use these heuristics:
+def _calc_cost(model: str, usage: object) -> float:
+    prices = _MODEL_PRICING.get(model, (15.00, 75.00, 18.75, 1.50))
+    ip, op, cwp, crp = prices
+    return (
+        getattr(usage, "input_tokens", 0)                  / 1_000_000 * ip
+        + getattr(usage, "output_tokens", 0)               / 1_000_000 * op
+        + getattr(usage, "cache_creation_input_tokens", 0) / 1_000_000 * cwp
+        + getattr(usage, "cache_read_input_tokens", 0)     / 1_000_000 * crp
+    )
 
-- `interesting` = true if the frame shows people, vehicles approaching the property, animals
-  larger than a small bird, packages, or anything that a homeowner would want to know about.
-  False for empty scenes, wind-blown vegetation, lighting/shadow changes, distant traffic, or
-  passing pets that clearly belong on the property.
+
+THUMB_SYSTEM = """You analyze still thumbnails from a home security camera system.
+
+The household has three known family members:
+- Adult male: wears glasses and has a beard
+- Adult female: wears glasses and long black hair
+- Young boy: approximately 5 years old
+
+The property has three cameras with different security contexts:
+- Garage: front of the property / driveway. Watch for dogs defecating on the lawn, deliveries \
+(couriers, packages), and any unfamiliar person near the entrance.
+- Backyard: enclosed private area within the property. Any unfamiliar person here is a \
+serious concern regardless of time of day.
+- Right_walkway: side access within the property perimeter. Any unfamiliar person here is a \
+serious concern regardless of time of day.
+
+Return a JSON object with these fields:
+
+- `interesting` = true if the scene shows any of:
+  - An unfamiliar person, or someone whose identity cannot be confirmed as a family member
+  - A delivery (courier, postal worker, package left at door)
+  - A dog on the property (especially defecating on the front lawn)
+  - Suspicious behavior: loitering, peering through windows, testing doors/gates/fences
+  - Any person in Backyard or Right_walkway not confirmed as a family member
+  False for: confirmed family members doing routine activity, empty scenes, wind-blown vegetation, \
+lighting changes, distant street traffic with no interaction with the property.
+
 - `alert_level`:
-    - "high"   = unfamiliar person, especially at night or near an entry point
-    - "medium" = vehicle, daytime visitor, package, unusual activity
-    - "low"    = routine activity or empty scene
-- `summary` = one sentence (≤ 200 chars), present tense, no preamble.
-- `subjects` = list of nouns: person, vehicle, animal, package, other. Empty list if none."""
+  - "high": unfamiliar person in Backyard or Right_walkway at any time; anyone testing entry \
+points (doors, gates, windows); loitering near the property at night; unrecognized person at \
+Garage after dark
+  - "medium": delivery or package drop-off; unfamiliar person at Garage during the day; dog on \
+the lawn; unrecognized vehicle parked near the property
+  - "low": confirmed family members going about normal activity; empty scene; passing street traffic
+
+- `summary` = one sentence (≤ 200 chars), present tense, no preamble. If a person is visible, \
+note whether they appear to be a family member or an unfamiliar individual.
+
+- `subjects` = list of nouns present: person, vehicle, animal, dog, package, delivery. \
+Empty list if none."""
 
 
 THUMB_SCHEMA = {
@@ -82,11 +127,22 @@ THUMB_SCHEMA = {
 }
 
 
-VIDEO_SYSTEM = """You analyze frames sampled evenly across a short security-camera clip.
+VIDEO_SYSTEM = """You analyze frames sampled evenly across a short home security camera clip.
 
-Describe what happens across the clip in 2-4 sentences: who or what appears, how they move,
-direction of travel, and anything notable about their behavior. Be concise and factual.
-No preamble, no JSON — plain prose only."""
+The household has three known family members:
+- Adult male: wears glasses and has a beard
+- Adult female: wears glasses and long black hair
+- Young boy: approximately 5 years old
+
+Describe what happens across the clip in 2-4 sentences:
+- If a person is visible: note whether they appear to be a family member or an unfamiliar \
+individual. For unfamiliar individuals, describe their appearance, movement pattern (purposeful, \
+hesitant, loitering), and any interaction with the property (doors, windows, gates, fences, \
+packages).
+- If an animal is visible: describe species, behavior, and exact location on the property.
+- If a delivery is visible: note the courier/service if identifiable, how the package is handled, \
+and where it is left.
+Be concise and factual. No preamble, no JSON — plain prose only."""
 
 
 @dataclass
@@ -199,7 +255,18 @@ def _image_block(path: Path) -> dict:
     }
 
 
-def analyze_thumbnail(thumb: Path) -> ThumbResult:
+def _camera_name(thumb: Path) -> str:
+    """Extract camera name from Reolink filename (e.g. Garage_00_20260513... → Garage)."""
+    m = re.match(r"^(.+?)_\d{2}_\d{14}", thumb.stem)
+    if m:
+        return m.group(1)
+    try:
+        return thumb.relative_to(WATCH_DIR).parts[0]
+    except (ValueError, IndexError):
+        return thumb.parent.name
+
+
+def analyze_thumbnail(thumb: Path, camera: str) -> tuple[ThumbResult, float]:
     response = client.messages.create(
         model=THUMB_MODEL,
         max_tokens=1024,
@@ -216,19 +283,20 @@ def analyze_thumbnail(thumb: Path) -> ThumbResult:
                 "role": "user",
                 "content": [
                     _image_block(thumb),
-                    {"type": "text", "text": "Analyze this camera thumbnail."},
+                    {"type": "text", "text": f"Camera: {camera}. Analyze this thumbnail."},
                 ],
             }
         ],
     )
     text = next((b.text for b in response.content if b.type == "text"), "")
     data = json.loads(text)
-    return ThumbResult(
+    result = ThumbResult(
         summary=data["summary"].strip(),
         subjects=list(data["subjects"]),
         alert_level=data["alert_level"],
         interesting=bool(data["interesting"]),
     )
+    return result, _calc_cost(THUMB_MODEL, response.usage)
 
 
 def extract_frames(video: Path, out_dir: Path, num_frames: int) -> list[Path]:
@@ -265,13 +333,13 @@ def extract_frames(video: Path, out_dir: Path, num_frames: int) -> list[Path]:
     return frames
 
 
-def analyze_video(video: Path) -> str:
+def analyze_video(video: Path) -> tuple[str, float]:
     with tempfile.TemporaryDirectory(prefix="reolink_frames_") as tmp:
         try:
             frames = extract_frames(video, Path(tmp), VIDEO_FRAMES)
         except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as e:
             log.warning("frame extraction failed for %s: %s", video, e)
-            return ""
+            return "", 0.0
 
         content: list[dict] = [_image_block(f) for f in frames]
         content.append({"type": "text", "text": "Describe what happens across these frames."})
@@ -281,7 +349,8 @@ def analyze_video(video: Path) -> str:
             system=VIDEO_SYSTEM,
             messages=[{"role": "user", "content": content}],
         )
-        return next((b.text for b in response.content if b.type == "text"), "").strip()
+        text = next((b.text for b in response.content if b.type == "text"), "").strip()
+        return text, _calc_cost(VIDEO_MODEL, response.usage)
 
 
 # ---------- Telegram ----------
@@ -308,11 +377,8 @@ def send_telegram(thumb: Path, caption: str) -> None:
         resp.raise_for_status()
 
 
-def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str) -> str:
-    try:
-        camera = thumb.relative_to(WATCH_DIR).parts[0]
-    except (ValueError, IndexError):
-        camera = thumb.parent.name
+def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost_usd: float) -> str:
+    camera = _camera_name(thumb)
 
     icon = {"high": "🚨", "medium": "⚠️", "low": "ℹ️"}.get(thumb_result.alert_level, "📷")
     lines = [
@@ -326,6 +392,7 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str) -> s
         lines.append(video_desc)
     lines.append("")
     lines.append(f"File: {thumb.name}")
+    lines.append(f"Cost: ${cost_usd:.4f}")
     return "\n".join(lines)
 
 
@@ -337,8 +404,9 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         log.info("not stable, will retry next cycle: %s", thumb)
         return
 
+    camera = _camera_name(thumb)
     try:
-        thumb_result = analyze_thumbnail(thumb)
+        thumb_result, thumb_cost = analyze_thumbnail(thumb, camera)
     except anthropic.APIError as e:
         log.exception("thumbnail API error for %s: %s", thumb, e)
         return
@@ -347,19 +415,21 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         mark_processed(conn, thumb)  # don't retry on a malformed response forever
         return
     log.info(
-        "thumb: interesting=%s level=%s subjects=%s",
+        "thumb: interesting=%s level=%s subjects=%s cost=$%.4f",
         thumb_result.interesting,
         thumb_result.alert_level,
         thumb_result.subjects,
+        thumb_cost,
     )
 
     video_desc = ""
+    video_cost = 0.0
     if thumb_result.interesting:
         video = wait_for_video(thumb, VIDEO_WAIT_SECONDS)
         if video:
             log.info("analyzing video frames from %s", video)
             try:
-                video_desc = analyze_video(video)
+                video_desc, video_cost = analyze_video(video)
             except anthropic.APIError as e:
                 log.exception("video API error for %s: %s", video, e)
         else:
@@ -369,7 +439,7 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         ALERT_ON == "interesting" and thumb_result.interesting
     )
     if should_notify:
-        caption = format_caption(thumb, thumb_result, video_desc)
+        caption = format_caption(thumb, thumb_result, video_desc, thumb_cost + video_cost)
         try:
             send_telegram(thumb, caption)
             log.info("alert sent for %s", thumb)
