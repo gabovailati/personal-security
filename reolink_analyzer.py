@@ -45,6 +45,14 @@ THUMB_MODEL = _env("THUMB_MODEL", "claude-opus-4-7")
 VIDEO_MODEL = _env("VIDEO_MODEL", "claude-opus-4-7")
 ALERT_ON = _env("ALERT_ON", "interesting").lower()
 
+# Pre-filter: cheap first pass to skip clearly empty frames before calling Opus.
+# PREFILTER_BACKEND: "none" (disabled), "ollama" (local SLM), "claude" (cloud model)
+# PREFILTER_MODEL:   model name — e.g. "moondream" for ollama, "claude-haiku-4-5" for claude
+# PREFILTER_OLLAMA_URL: base URL of the Ollama server
+PREFILTER_BACKEND = _env("PREFILTER_BACKEND", "none").lower()
+PREFILTER_MODEL = _env("PREFILTER_MODEL", "moondream")
+PREFILTER_OLLAMA_URL = _env("PREFILTER_OLLAMA_URL", "http://localhost:11434")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -396,6 +404,63 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost
     return "\n".join(lines)
 
 
+# ---------- pre-filter ----------
+
+_PREFILTER_PROMPT = (
+    "Does this image show a person, animal, vehicle, or package? Answer only yes or no."
+)
+
+
+def _prefilter_ollama(thumb: Path) -> bool:
+    data = base64.standard_b64encode(thumb.read_bytes()).decode("ascii")
+    try:
+        resp = requests.post(
+            f"{PREFILTER_OLLAMA_URL}/api/generate",
+            json={"model": PREFILTER_MODEL, "prompt": _PREFILTER_PROMPT,
+                  "images": [data], "stream": False},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        answer = resp.json().get("response", "").strip().lower()
+        result = "yes" in answer
+        log.info("prefilter ollama: %s → %s", thumb.name, "pass" if result else "skip")
+        return result
+    except Exception as e:
+        log.warning("prefilter_ollama failed for %s: %s — passing through", thumb.name, e)
+        return True
+
+
+def _prefilter_claude(thumb: Path) -> bool:
+    try:
+        response = client.messages.create(
+            model=PREFILTER_MODEL,
+            max_tokens=10,
+            messages=[{"role": "user", "content": [
+                _image_block(thumb),
+                {"type": "text", "text": _PREFILTER_PROMPT},
+            ]}],
+        )
+        answer = next((b.text for b in response.content if b.type == "text"), "").strip().lower()
+        result = "yes" in answer
+        log.info("prefilter claude: %s → %s", thumb.name, "pass" if result else "skip")
+        return result
+    except Exception as e:
+        log.warning("prefilter_claude failed for %s: %s — passing through", thumb.name, e)
+        return True
+
+
+def prefilter_thumbnail(thumb: Path) -> bool:
+    """Return False if the image is clearly empty; errors always pass through to avoid missed alerts."""
+    if PREFILTER_BACKEND == "none":
+        return True
+    if PREFILTER_BACKEND == "ollama":
+        return _prefilter_ollama(thumb)
+    if PREFILTER_BACKEND == "claude":
+        return _prefilter_claude(thumb)
+    log.warning("unknown PREFILTER_BACKEND %r — passing through", PREFILTER_BACKEND)
+    return True
+
+
 # ---------- main loop ----------
 
 def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
@@ -405,8 +470,16 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         return
 
     camera = _camera_name(thumb)
+
+    if not prefilter_thumbnail(thumb):
+        mark_processed(conn, thumb)
+        return
+
     try:
         thumb_result, thumb_cost = analyze_thumbnail(thumb, camera)
+    except anthropic.OverloadedError:
+        log.warning("API overloaded for %s, will retry after backoff", thumb)
+        raise
     except anthropic.APIError as e:
         log.exception("thumbnail API error for %s: %s", thumb, e)
         return
@@ -430,6 +503,8 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
             log.info("analyzing video frames from %s", video)
             try:
                 video_desc, video_cost = analyze_video(video)
+            except anthropic.OverloadedError:
+                log.warning("API overloaded for video %s, sending thumbnail-only alert", video)
             except anthropic.APIError as e:
                 log.exception("video API error for %s: %s", video, e)
         else:
@@ -477,9 +552,16 @@ def main(argv: list[str] | None = None) -> int:
         if seeded:
             log.info("seeded %d backlog file(s) as already processed", seeded)
 
+    prefilter_info = (
+        f"ollama/{PREFILTER_MODEL} @ {PREFILTER_OLLAMA_URL}"
+        if PREFILTER_BACKEND == "ollama"
+        else f"claude/{PREFILTER_MODEL}"
+        if PREFILTER_BACKEND == "claude"
+        else "none"
+    )
     log.info(
-        "watching %s every %ds (thumb=%s, video=%s, alert_on=%s)",
-        WATCH_DIR, POLL_SECONDS, THUMB_MODEL, VIDEO_MODEL, ALERT_ON,
+        "watching %s every %ds (prefilter=%s, thumb=%s, video=%s, alert_on=%s)",
+        WATCH_DIR, POLL_SECONDS, prefilter_info, THUMB_MODEL, VIDEO_MODEL, ALERT_ON,
     )
 
     while True:
@@ -489,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             log.info("stopping")
             return 0
+        except anthropic.OverloadedError:
+            log.warning("API overloaded; pausing 60s before retrying")
+            time.sleep(60)
         except Exception:  # noqa: BLE001
             log.exception("scan loop error")
         if args.once:
