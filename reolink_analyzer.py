@@ -438,13 +438,14 @@ def _prefilter_ollama(thumb: Path) -> bool:
     data = base64.standard_b64encode(_resize_for_prefilter(thumb)).decode("ascii")
     try:
         resp = requests.post(
-            f"{PREFILTER_OLLAMA_URL}/api/generate",
-            json={"model": PREFILTER_MODEL, "prompt": _PREFILTER_PROMPT,
-                  "images": [data], "stream": False},
+            f"{PREFILTER_OLLAMA_URL}/api/chat",
+            json={"model": PREFILTER_MODEL, "stream": False,
+                  "messages": [{"role": "user", "content": _PREFILTER_PROMPT,
+                                 "images": [data]}]},
             timeout=PREFILTER_TIMEOUT,
         )
         resp.raise_for_status()
-        answer = resp.json().get("response", "").strip()
+        answer = resp.json().get("message", {}).get("content", "").strip()
         if not answer:
             log.warning("prefilter ollama: empty response for %s — passing through", thumb.name)
             return True
