@@ -408,10 +408,8 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost
 # ---------- pre-filter ----------
 
 _PREFILTER_PROMPT = (
-    "Examine every part of this security camera image carefully, including edges and corners. "
-    "Is there a person (even partially visible or cut off at the frame edge), animal, moving "
-    "vehicle, or package anywhere in the scene? "
-    "When uncertain, answer yes. Answer only yes or no."
+    "Is there a person or animal anywhere in this image, including near the edges? "
+    "Answer yes or no only."
 )
 
 
@@ -426,6 +424,9 @@ def _prefilter_ollama(thumb: Path) -> bool:
         )
         resp.raise_for_status()
         answer = resp.json().get("response", "").strip()
+        if not answer:
+            log.warning("prefilter ollama: empty response for %s — passing through", thumb.name)
+            return True
         result = "yes" in answer.lower()
         log.info("prefilter ollama: %s → %s | SLM said: %r", thumb.name, "pass" if result else "skip", answer)
         return result
