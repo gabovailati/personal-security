@@ -425,9 +425,9 @@ def _prefilter_ollama(thumb: Path) -> bool:
             timeout=PREFILTER_TIMEOUT,
         )
         resp.raise_for_status()
-        answer = resp.json().get("response", "").strip().lower()
-        result = "yes" in answer
-        log.info("prefilter ollama: %s → %s", thumb.name, "pass" if result else "skip")
+        answer = resp.json().get("response", "").strip()
+        result = "yes" in answer.lower()
+        log.info("prefilter ollama: %s → %s | SLM said: %r", thumb.name, "pass" if result else "skip", answer)
         return result
     except Exception as e:
         log.warning("prefilter_ollama failed for %s: %s — passing through", thumb.name, e)
@@ -444,9 +444,9 @@ def _prefilter_claude(thumb: Path) -> bool:
                 {"type": "text", "text": _PREFILTER_PROMPT},
             ]}],
         )
-        answer = next((b.text for b in response.content if b.type == "text"), "").strip().lower()
-        result = "yes" in answer
-        log.info("prefilter claude: %s → %s", thumb.name, "pass" if result else "skip")
+        answer = next((b.text for b in response.content if b.type == "text"), "").strip()
+        result = "yes" in answer.lower()
+        log.info("prefilter claude: %s → %s | SLM said: %r", thumb.name, "pass" if result else "skip", answer)
         return result
     except Exception as e:
         log.warning("prefilter_claude failed for %s: %s — passing through", thumb.name, e)
@@ -468,6 +468,7 @@ def prefilter_thumbnail(thumb: Path) -> bool:
 # ---------- main loop ----------
 
 def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
+    log.info("─" * 60)
     log.info("processing %s", thumb)
     if not is_stable(thumb):
         log.info("not stable, will retry next cycle: %s", thumb)
