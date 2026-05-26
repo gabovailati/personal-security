@@ -408,7 +408,10 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost
 # ---------- pre-filter ----------
 
 _PREFILTER_PROMPT = (
-    "Does this image show a person, animal, vehicle, or package? Answer only yes or no."
+    "Examine every part of this security camera image carefully, including edges and corners. "
+    "Is there a person (even partially visible or cut off at the frame edge), animal, moving "
+    "vehicle, or package anywhere in the scene? "
+    "When uncertain, answer yes. Answer only yes or no."
 )
 
 
