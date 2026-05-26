@@ -416,8 +416,26 @@ _PREFILTER_KEYWORDS = {
 }
 
 
+def _resize_for_prefilter(thumb: Path, max_width: int = 1024) -> bytes:
+    """Downscale image to max_width for the prefilter model; returns original bytes on failure."""
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(thumb),
+             "-vf", f"scale='min({max_width},iw)':-2", "-q:v", "3", str(tmp_path)],
+            check=True,
+        )
+        return tmp_path.read_bytes()
+    except Exception as e:
+        log.warning("prefilter resize failed for %s: %s — using original", thumb.name, e)
+        return thumb.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _prefilter_ollama(thumb: Path) -> bool:
-    data = base64.standard_b64encode(thumb.read_bytes()).decode("ascii")
+    data = base64.standard_b64encode(_resize_for_prefilter(thumb)).decode("ascii")
     try:
         resp = requests.post(
             f"{PREFILTER_OLLAMA_URL}/api/generate",
