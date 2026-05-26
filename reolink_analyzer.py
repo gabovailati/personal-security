@@ -407,10 +407,13 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost
 
 # ---------- pre-filter ----------
 
-_PREFILTER_PROMPT = (
-    "Is there a person or animal anywhere in this image, including near the edges? "
-    "Answer yes or no only."
-)
+_PREFILTER_PROMPT = "Describe what you see in this security camera image in one sentence."
+
+_PREFILTER_KEYWORDS = {
+    "person", "people", "man", "woman", "child", "boy", "girl",
+    "individual", "figure", "human", "someone", "somebody",
+    "dog",
+}
 
 
 def _prefilter_ollama(thumb: Path) -> bool:
@@ -427,7 +430,8 @@ def _prefilter_ollama(thumb: Path) -> bool:
         if not answer:
             log.warning("prefilter ollama: empty response for %s — passing through", thumb.name)
             return True
-        result = "yes" in answer.lower()
+        words = set(re.findall(r"[a-z]+", answer.lower()))
+        result = bool(words & _PREFILTER_KEYWORDS)
         log.info("prefilter ollama: %s → %s | SLM said: %r", thumb.name, "pass" if result else "skip", answer)
         return result
     except Exception as e:
@@ -439,14 +443,15 @@ def _prefilter_claude(thumb: Path) -> bool:
     try:
         response = client.messages.create(
             model=PREFILTER_MODEL,
-            max_tokens=10,
+            max_tokens=60,
             messages=[{"role": "user", "content": [
                 _image_block(thumb),
                 {"type": "text", "text": _PREFILTER_PROMPT},
             ]}],
         )
         answer = next((b.text for b in response.content if b.type == "text"), "").strip()
-        result = "yes" in answer.lower()
+        words = set(re.findall(r"[a-z]+", answer.lower()))
+        result = bool(words & _PREFILTER_KEYWORDS)
         log.info("prefilter claude: %s → %s | SLM said: %r", thumb.name, "pass" if result else "skip", answer)
         return result
     except Exception as e:
