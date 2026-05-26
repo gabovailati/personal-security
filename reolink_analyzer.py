@@ -50,7 +50,7 @@ ALERT_ON = _env("ALERT_ON", "interesting").lower()
 # PREFILTER_MODEL:   model name — e.g. "moondream" for ollama, "claude-haiku-4-5" for claude
 # PREFILTER_OLLAMA_URL: base URL of the Ollama server
 PREFILTER_BACKEND = _env("PREFILTER_BACKEND", "none").lower()
-PREFILTER_MODEL = _env("PREFILTER_MODEL", "moondream")
+PREFILTER_MODEL = _env("PREFILTER_MODEL", "moondream:v2")
 PREFILTER_OLLAMA_URL = _env("PREFILTER_OLLAMA_URL", "http://localhost:11434")
 PREFILTER_TIMEOUT = int(_env("PREFILTER_TIMEOUT", "120"))
 
