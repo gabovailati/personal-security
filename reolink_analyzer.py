@@ -52,6 +52,7 @@ ALERT_ON = _env("ALERT_ON", "interesting").lower()
 PREFILTER_BACKEND = _env("PREFILTER_BACKEND", "none").lower()
 PREFILTER_MODEL = _env("PREFILTER_MODEL", "moondream")
 PREFILTER_OLLAMA_URL = _env("PREFILTER_OLLAMA_URL", "http://localhost:11434")
+PREFILTER_TIMEOUT = int(_env("PREFILTER_TIMEOUT", "120"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -418,7 +419,7 @@ def _prefilter_ollama(thumb: Path) -> bool:
             f"{PREFILTER_OLLAMA_URL}/api/generate",
             json={"model": PREFILTER_MODEL, "prompt": _PREFILTER_PROMPT,
                   "images": [data], "stream": False},
-            timeout=30,
+            timeout=PREFILTER_TIMEOUT,
         )
         resp.raise_for_status()
         answer = resp.json().get("response", "").strip().lower()
