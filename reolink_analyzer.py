@@ -386,7 +386,7 @@ def send_telegram(thumb: Path, caption: str) -> None:
         resp.raise_for_status()
 
 
-def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost_usd: float) -> str:
+def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost_usd: float, model: str) -> str:
     camera = _camera_name(thumb)
 
     icon = {"high": "🚨", "medium": "⚠️", "low": "ℹ️"}.get(thumb_result.alert_level, "📷")
@@ -402,6 +402,7 @@ def format_caption(thumb: Path, thumb_result: ThumbResult, video_desc: str, cost
     lines.append("")
     lines.append(f"File: {thumb.name}")
     lines.append(f"Cost: ${cost_usd:.4f}")
+    lines.append(f"Model: {model}")
     return "\n".join(lines)
 
 
@@ -544,7 +545,8 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         ALERT_ON == "interesting" and thumb_result.interesting
     )
     if should_notify:
-        caption = format_caption(thumb, thumb_result, video_desc, thumb_cost + video_cost)
+        used_model = VIDEO_MODEL if video_desc else THUMB_MODEL
+        caption = format_caption(thumb, thumb_result, video_desc, thumb_cost + video_cost, used_model)
         try:
             send_telegram(thumb, caption)
             log.info("alert sent for %s", thumb)
