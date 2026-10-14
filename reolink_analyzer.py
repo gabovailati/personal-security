@@ -41,6 +41,12 @@ MIN_FILE_AGE_SECONDS = int(_env("MIN_FILE_AGE_SECONDS", "5"))
 SKIP_OLDER_THAN_HOURS = float(_env("SKIP_OLDER_THAN_HOURS", "1"))
 VIDEO_WAIT_SECONDS = int(_env("VIDEO_WAIT_SECONDS", "60"))
 VIDEO_FRAMES = int(_env("VIDEO_FRAMES", "6"))
+# Cameras sometimes upload a clip with no .jpg snapshot. Such a clip is analysed
+# from a frame of the video once it has been idle this long (so a late snapshot
+# still wins), unless it starts within EVENT_GAP_SECONDS of an earlier clip from
+# the same camera, in which case it is the continuation of an event already handled.
+ORPHAN_VIDEO_GRACE_SECONDS = int(_env("ORPHAN_VIDEO_GRACE_SECONDS", "60"))
+EVENT_GAP_SECONDS = int(_env("EVENT_GAP_SECONDS", "120"))
 THUMB_MODEL = _env("THUMB_MODEL", "claude-opus-4-7")
 VIDEO_MODEL = _env("VIDEO_MODEL", "claude-opus-4-7")
 ALERT_ON = _env("ALERT_ON", "interesting").lower()
@@ -205,7 +211,7 @@ def seed_backlog(conn: sqlite3.Connection) -> int:
     """On startup, mark anything older than SKIP_OLDER_THAN_HOURS as already processed."""
     cutoff = time.time() - SKIP_OLDER_THAN_HOURS * 3600
     count = 0
-    for path in WATCH_DIR.rglob("*.jpg"):
+    for path in [*WATCH_DIR.rglob("*.jpg"), *find_orphan_videos_all()]:
         try:
             if path.stat().st_mtime < cutoff and not is_processed(conn, path):
                 mark_processed(conn, path)
@@ -231,6 +237,71 @@ def find_new_thumbnails(conn: sqlite3.Connection) -> list[Path]:
             continue
         out.append(path)
     return sorted(out, key=lambda p: p.stat().st_mtime)
+
+
+def find_orphan_videos_all() -> list[Path]:
+    """Clips the camera uploaded without a .jpg snapshot."""
+    return [p for p in WATCH_DIR.rglob("*.mp4") if not p.with_suffix(".jpg").exists()]
+
+
+def find_orphan_videos(conn: sqlite3.Connection) -> list[Path]:
+    now = time.time()
+    out: list[Path] = []
+    for path in find_orphan_videos_all():
+        if is_processed(conn, path):
+            continue
+        try:
+            idle = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if idle < ORPHAN_VIDEO_GRACE_SECONDS:
+            continue
+        out.append(path)
+    return sorted(out, key=lambda p: p.stat().st_mtime)
+
+
+_CLIP_RE = re.compile(r"^(.+?)_\d{2}_(\d{14})$")
+
+
+def _clip_start(path: Path) -> tuple[str, float] | None:
+    """(camera, start time from the Reolink filename) or None if it doesn't match."""
+    m = _CLIP_RE.match(path.stem)
+    if not m:
+        return None
+    return m.group(1), time.mktime(time.strptime(m.group(2), "%Y%m%d%H%M%S"))
+
+
+def continues_earlier_clip(video: Path) -> bool:
+    """True if the same camera started another clip up to EVENT_GAP_SECONDS before this one."""
+    me = _clip_start(video)
+    if me is None or EVENT_GAP_SECONDS <= 0:
+        return False
+    camera, start = me
+    for other in video.parent.iterdir():
+        if other.suffix.lower() not in (".jpg", ".mp4") or other.stem == video.stem:
+            continue
+        o = _clip_start(other)
+        if o and o[0] == camera and 0 < start - o[1] <= EVENT_GAP_SECONDS:
+            return True
+    return False
+
+
+def process_orphan_video(conn: sqlite3.Connection, video: Path) -> None:
+    """Analyse a clip that arrived without a snapshot, using a frame from the clip as its thumbnail."""
+    if continues_earlier_clip(video):
+        log.info("no snapshot for %s, but it continues an earlier clip from the same camera; skipping", video.name)
+        mark_processed(conn, video)
+        return
+    with tempfile.TemporaryDirectory(prefix="reolink_orphan_") as tmp:
+        try:
+            frame = extract_frames(video, Path(tmp), 1)[0]
+        except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as e:
+            log.warning("could not take a frame from %s (%s); skipping", video, e)
+            mark_processed(conn, video)
+            return
+        thumb = frame.rename(frame.with_name(video.stem + ".jpg"))  # keeps the camera name for alerts
+        log.info("no snapshot for %s; using a frame from the video", video.name)
+        process_thumbnail(conn, thumb, orphan_video=video)
 
 
 def is_stable(path: Path, interval: float = 2.0) -> bool:
@@ -504,7 +575,10 @@ def prefilter_thumbnail(thumb: Path) -> bool:
 
 # ---------- main loop ----------
 
-def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
+def process_thumbnail(conn: sqlite3.Connection, thumb: Path, orphan_video: Path | None = None) -> None:
+    """orphan_video: the clip `thumb` was taken from when the camera sent no snapshot.
+    It is the file recorded as processed, since `thumb` is only a temporary frame."""
+    done = orphan_video or thumb
     log.info("─" * 60)
     log.info("processing %s", thumb)
     if not is_stable(thumb):
@@ -514,7 +588,7 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
     camera = _camera_name(thumb)
 
     if not prefilter_thumbnail(thumb):
-        mark_processed(conn, thumb)
+        mark_processed(conn, done)
         return
 
     try:
@@ -527,7 +601,7 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
         return
     except (json.JSONDecodeError, KeyError) as e:
         log.exception("thumbnail parse error for %s: %s", thumb, e)
-        mark_processed(conn, thumb)  # don't retry on a malformed response forever
+        mark_processed(conn, done)  # don't retry on a malformed response forever
         return
     log.info(
         "thumb: interesting=%s level=%s subjects=%s cost=$%.4f",
@@ -540,7 +614,7 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
     video_desc = ""
     video_cost = 0.0
     if thumb_result.interesting:
-        video = wait_for_video(thumb, VIDEO_WAIT_SECONDS)
+        video = orphan_video or wait_for_video(thumb, VIDEO_WAIT_SECONDS)
         if video:
             log.info("analyzing video frames from %s", video)
             try:
@@ -566,7 +640,7 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
             log.exception("telegram send failed for %s: %s", thumb, e)
             return  # leave unmarked so we retry next cycle
 
-    mark_processed(conn, thumb)
+    mark_processed(conn, done)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -612,6 +686,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             for thumb in find_new_thumbnails(conn):
                 process_thumbnail(conn, thumb)
+            for video in find_orphan_videos(conn):
+                process_orphan_video(conn, video)
         except KeyboardInterrupt:
             log.info("stopping")
             return 0
