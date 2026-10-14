@@ -54,11 +54,22 @@ PREFILTER_MODEL = _env("PREFILTER_MODEL", "moondream:v2")
 PREFILTER_OLLAMA_URL = _env("PREFILTER_OLLAMA_URL", "http://localhost:11434")
 PREFILTER_TIMEOUT = int(_env("PREFILTER_TIMEOUT", "120"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+class _RedactingFormatter(logging.Formatter):
+    """Keeps the Telegram bot token out of the logs: requests/urllib3 errors include the URL."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).replace(TELEGRAM_BOT_TOKEN, "<telegram-token>")
+
+
+logging.basicConfig(level=logging.INFO)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(_RedactingFormatter("%(asctime)s %(levelname)s %(message)s"))
 log = logging.getLogger("reolink")
+
+
+def _is_overloaded(e: BaseException) -> bool:
+    """Claude answers HTTP 529 when overloaded; the SDK has no dedicated exception class for it."""
+    return isinstance(e, anthropic.APIStatusError) and e.status_code == 529
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -508,10 +519,10 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
 
     try:
         thumb_result, thumb_cost = analyze_thumbnail(thumb, camera)
-    except anthropic.OverloadedError:
-        log.warning("API overloaded for %s, will retry after backoff", thumb)
-        raise
     except anthropic.APIError as e:
+        if _is_overloaded(e):
+            log.warning("API overloaded for %s, will retry after backoff", thumb)
+            raise
         log.exception("thumbnail API error for %s: %s", thumb, e)
         return
     except (json.JSONDecodeError, KeyError) as e:
@@ -534,10 +545,11 @@ def process_thumbnail(conn: sqlite3.Connection, thumb: Path) -> None:
             log.info("analyzing video frames from %s", video)
             try:
                 video_desc, video_cost = analyze_video(video)
-            except anthropic.OverloadedError:
-                log.warning("API overloaded for video %s, sending thumbnail-only alert", video)
             except anthropic.APIError as e:
-                log.exception("video API error for %s: %s", video, e)
+                if _is_overloaded(e):
+                    log.warning("API overloaded for video %s, sending thumbnail-only alert", video)
+                else:
+                    log.exception("video API error for %s: %s", video, e)
         else:
             log.info("no matching video found within timeout for %s", thumb)
 
@@ -603,11 +615,12 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             log.info("stopping")
             return 0
-        except anthropic.OverloadedError:
-            log.warning("API overloaded; pausing 60s before retrying")
-            time.sleep(60)
-        except Exception:  # noqa: BLE001
-            log.exception("scan loop error")
+        except Exception as e:  # noqa: BLE001
+            if _is_overloaded(e):
+                log.warning("API overloaded; pausing 60s before retrying")
+                time.sleep(60)
+            else:
+                log.exception("scan loop error")
         if args.once:
             return 0
         time.sleep(POLL_SECONDS)
